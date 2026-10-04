@@ -49,7 +49,7 @@ from openpyxl.utils import get_column_letter
 # ============================================================
 # CONFIGURACIÓN
 # ============================================================
-APP_VERSION = "V9.1"
+APP_VERSION = "V9.2"
 MAX_ZIP_DEPTH = 8
 MAX_INPUT_PDFS = 1500
 PROCESS_CHUNK_SIZE = 150
@@ -480,7 +480,7 @@ def parse_pdf(pdf_path: Path, filename: str, piece: int) -> Dict[str, object]:
                 for i in range(min(num, len(CHATTER_APOYOS_CHARACTERISTICS))):
                     char = CHATTER_APOYOS_CHARACTERISTICS[i]
                     measurement = raw[i * 2]
-                    result["chatter apoyos"].append(base_row(
+                    result["Chatter apoyos"].append(base_row(
                         filename, piece, apoyo=apoyo, char=char,
                         medicion=measurement, area="Apoyos",
                         resultado=get_resultado(measurement, char, "Chatter_Apoyos"),
@@ -693,7 +693,7 @@ def process_uploaded_batch(uploaded_files: List, workers: int) -> Dict[str, int]
             for sheet, parts in frames_acc.items():
                 if parts:
                     chunk_frames[sheet] = pd.concat(parts, ignore_index=True)
-            ford = make_ford_df(chunk_frames.get("chatter apoyos", pd.DataFrame(columns=COLUMNS)))
+            ford = make_ford_df(chunk_frames.get("Chatter apoyos", pd.DataFrame(columns=COLUMNS)))
             if not ford.empty:
                 chunk_frames["Chatter Journal Ford"] = ford
             save_batch_frames(batch_dir, chunk_frames)
