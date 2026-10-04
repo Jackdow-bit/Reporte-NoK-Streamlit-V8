@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Reporte NoK Streamlit V9 - optimizado para Streamlit Community Cloud
+Reporte NoK Streamlit V9.1 - optimizado para Streamlit Community Cloud
 
 Objetivos:
 - PDFs individuales y uno/muchos ZIP.
@@ -51,7 +51,8 @@ from openpyxl.utils import get_column_letter
 # ============================================================
 APP_VERSION = "V9.1"
 MAX_ZIP_DEPTH = 8
-DEFAULT_BATCH_LIMIT = 150
+MAX_INPUT_PDFS = 1500
+PROCESS_CHUNK_SIZE = 150
 MAX_WORKERS = 6
 
 CHATTER_LEVAS_THRESHOLD = 0.0001
@@ -610,7 +611,7 @@ def build_master(data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=COLUMNS)
 
 
-def process_uploaded_batch(uploaded_files: List, batch_limit: int, workers: int) -> Dict[str, int]:
+def process_uploaded_batch(uploaded_files: List, workers: int) -> Dict[str, int]:
     conn = db_conn()
     source_dir = WORKSPACE / "incoming" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     source_dir.mkdir(parents=True, exist_ok=True)
@@ -639,8 +640,8 @@ def process_uploaded_batch(uploaded_files: List, batch_limit: int, workers: int)
         except Exception as e:
             input_errors.append(f"{p.name}: SHA-256: {e}")
 
-    if len(unique_jobs) > batch_limit:
-        st.error(f"Este lote contiene {len(unique_jobs)} PDFs únicos y supera el límite seguro de {batch_limit}. Divide la carga en varios lotes.")
+    if len(unique_jobs) > MAX_INPUT_PDFS:
+        st.error(f"La carga contiene {len(unique_jobs):,} PDFs únicos. El máximo permitido por ejecución es {MAX_INPUT_PDFS:,} PDFs.")
         shutil.rmtree(source_dir, ignore_errors=True)
         return {"recibidos": len(uploaded_files), "pdfs": len(pdf_paths), "procesados": 0, "duplicados": duplicates, "errores": len(input_errors) + 1}
 
@@ -648,57 +649,70 @@ def process_uploaded_batch(uploaded_files: List, batch_limit: int, workers: int)
     batch_dir = WORKSPACE / "batches" / batch_id
     batch_dir.mkdir(parents=True, exist_ok=True)
 
-    frames_acc = {k: [] for k in ["Apoyos", "Levas", "chatter Levas", "Chatter apoyos"]}
     errors = list(input_errors)
     progress = st.progress(0, text="Procesando PDFs…")
     started = time.perf_counter()
     completed = 0
+    jobs = [(p, name, num, digest) for p, name, num, digest in unique_jobs]
 
-    jobs = [(p, name, num) for p, name, num, _ in unique_jobs]
-    with ThreadPoolExecutor(max_workers=min(max(1, workers), max(1, len(jobs)))) as executor:
-        future_map = {executor.submit(process_pdf_job, job): job for job in jobs}
-        for future in as_completed(future_map):
-            job = future_map[future]
-            try:
-                out = future.result()
-                if out["ok"]:
-                    for sheet, df in out["data"].items():
-                        if not df.empty:
-                            frames_acc[sheet].append(df)
-                    digest = next(d for p, n, num, d in unique_jobs if p == job[0])
-                    register_file(conn, digest, job[1], job[2], "OK", "")
-                else:
-                    digest = next(d for p, n, num, d in unique_jobs if p == job[0])
-                    register_file(conn, digest, job[1], job[2], "ERROR", out["error"])
-                    errors.append(f"{job[1]}: {out['error']}")
-            except Exception as e:
-                errors.append(f"{job[1]}: {type(e).__name__}: {e}")
-            completed += 1
-            elapsed = max(time.perf_counter() - started, 0.001)
-            rate = completed / elapsed
-            eta = (len(jobs) - completed) / rate if rate else 0
-            progress.progress(completed / max(len(jobs), 1), text=f"{completed}/{len(jobs)} | {rate:.1f} PDF/s | ETA {eta/60:.1f} min")
+    # Importante: el usuario puede cargar hasta 1,500 PDFs de una vez, pero el
+    # motor sólo mantiene PROCESS_CHUNK_SIZE resultados PDF en memoria a la vez.
+    for chunk_start in range(0, len(jobs), PROCESS_CHUNK_SIZE):
+        chunk = jobs[chunk_start:chunk_start + PROCESS_CHUNK_SIZE]
+        frames_acc = {k: [] for k in ["Apoyos", "Levas", "chatter Levas", "Chatter apoyos"]}
+        chunk_errors = []
 
-    final_frames = {}
-    for sheet, parts in frames_acc.items():
-        if parts:
-            final_frames[sheet] = pd.concat(parts, ignore_index=True)
-    ford = make_ford_df(final_frames.get("chatter apoyos", pd.DataFrame(columns=COLUMNS)))
-    if not ford.empty:
-        final_frames["Chatter Journal Ford"] = ford
+        with st.status(f"Procesando bloque {chunk_start // PROCESS_CHUNK_SIZE + 1}…", expanded=False) as block_status:
+            with ThreadPoolExecutor(max_workers=min(max(1, workers), max(1, len(chunk)))) as executor:
+                future_map = {executor.submit(process_pdf_job, (p, name, num)): (p, name, num, digest) for p, name, num, digest in chunk}
+                for future in as_completed(future_map):
+                    p, name, num, digest = future_map[future]
+                    try:
+                        out = future.result()
+                        if out["ok"]:
+                            for sheet, df in out["data"].items():
+                                if not df.empty:
+                                    frames_acc[sheet].append(df)
+                            register_file(conn, digest, name, num, "OK", "")
+                        else:
+                            register_file(conn, digest, name, num, "ERROR", out["error"])
+                            chunk_errors.append(f"{name}: {out['error']}")
+                    except Exception as e:
+                        register_file(conn, digest, name, num, "ERROR", f"{type(e).__name__}: {e}")
+                        chunk_errors.append(f"{name}: {type(e).__name__}: {e}")
 
-    save_batch_frames(batch_dir, final_frames)
+                    completed += 1
+                    elapsed = max(time.perf_counter() - started, 0.001)
+                    rate = completed / elapsed
+                    eta = (len(jobs) - completed) / rate if rate else 0
+                    progress.progress(completed / max(len(jobs), 1), text=f"{completed:,}/{len(jobs):,} | {rate:.1f} PDF/s | ETA {eta/60:.1f} min")
+
+            # Escribimos inmediatamente el bloque en CSV comprimido y liberamos
+            # sus DataFrames antes de comenzar el siguiente bloque.
+            chunk_frames = {}
+            for sheet, parts in frames_acc.items():
+                if parts:
+                    chunk_frames[sheet] = pd.concat(parts, ignore_index=True)
+            ford = make_ford_df(chunk_frames.get("chatter apoyos", pd.DataFrame(columns=COLUMNS)))
+            if not ford.empty:
+                chunk_frames["Chatter Journal Ford"] = ford
+            save_batch_frames(batch_dir, chunk_frames)
+            del chunk_frames, frames_acc
+            errors.extend(chunk_errors)
+            block_status.update(label=f"Bloque terminado: {len(chunk):,} PDFs", state="complete")
+
     (batch_dir / "errors.json").write_text(json.dumps(errors, ensure_ascii=False, indent=2), encoding="utf-8")
     (batch_dir / "meta.json").write_text(json.dumps({
         "batch_id": batch_id, "files": len(uploaded_files), "pdfs": len(pdf_paths),
-        "processed": len(jobs) - len(errors) + len(input_errors), "duplicates": duplicates,
+        "processed": len(jobs), "duplicates": duplicates,
         "errors": len(errors), "elapsed_s": time.perf_counter() - started,
+        "input_limit": MAX_INPUT_PDFS, "internal_chunk_size": PROCESS_CHUNK_SIZE,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # Los PDFs temporales se eliminan al terminar; sólo quedan CSV.gz compactos.
+    # Los PDFs temporales se eliminan; sólo quedan resultados compactos CSV.gz.
     shutil.rmtree(source_dir, ignore_errors=True)
 
-    st.success(f"Lote terminado: {len(jobs)} PDF(s) procesados, {duplicates} duplicado(s), {len(errors)} incidencia(s).")
+    st.success(f"Carga terminada: {len(jobs):,} PDF(s) procesados en bloques de {PROCESS_CHUNK_SIZE}, {duplicates:,} duplicado(s), {len(errors):,} incidencia(s).")
     return {"recibidos": len(uploaded_files), "pdfs": len(pdf_paths), "procesados": len(jobs), "duplicados": duplicates, "errores": len(errors)}
 
 
@@ -807,6 +821,8 @@ def generate_excel() -> bytes:
 # DASHBOARD
 # ============================================================
 def dashboard(data: Dict[str, pd.DataFrame]):
+    for _k in ["Apoyos", "Levas", "chatter Levas", "Chatter apoyos", "Chatter Journal Ford"]:
+        data.setdefault(_k, pd.DataFrame(columns=COLUMNS))
     master = build_master(data)
     if master.empty:
         st.info("Procesa al menos un lote para activar el dashboard.")
@@ -840,7 +856,7 @@ def dashboard(data: Dict[str, pd.DataFrame]):
     c4.metric("Rechazo", f"{rejection:.2f}%")
     c5.metric("NOK mediciones", f"{len(nok):,}")
 
-    tab1, tab2, tab3, tab4 = st.tabs(["🏁 Ejecutivo", "🟦 Levas", "🟩 Apoyos", "🔎 Características"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["🏁 Ejecutivo", "🟦 Levas", "🟩 Apoyos", "🔥 Chatter", "🔎 Características"])
 
     with tab1:
         col1, col2 = st.columns(2)
@@ -918,6 +934,59 @@ def dashboard(data: Dict[str, pd.DataFrame]):
                 st.plotly_chart(fig, use_container_width=True)
 
     with tab4:
+        st.markdown("### 🔥 Análisis específico de Chatter")
+        chatter_levas = data.get("chatter Levas", pd.DataFrame(columns=COLUMNS)).copy()
+        chatter_apoyos = data.get("Chatter apoyos", pd.DataFrame(columns=COLUMNS)).copy()
+        chatter_levas["Medicion"] = pd.to_numeric(chatter_levas.get("Medicion", pd.Series(dtype=float)), errors="coerce") if not chatter_levas.empty else chatter_levas.get("Medicion", pd.Series(dtype=float))
+        chatter_apoyos["Medicion"] = pd.to_numeric(chatter_apoyos.get("Medicion", pd.Series(dtype=float)), errors="coerce") if not chatter_apoyos.empty else chatter_apoyos.get("Medicion", pd.Series(dtype=float))
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if chatter_levas.empty:
+                st.info("No hay datos de Chatter Levas.")
+            else:
+                n = chatter_levas[chatter_levas["Resultado"] == "Nok"].groupby("Leva").size().reset_index(name="NOK").sort_values("NOK", ascending=False)
+                fig = px.bar(n, x="Leva", y="NOK", title="Chatter Levas — NOK por Leva")
+                st.plotly_chart(fig, use_container_width=True)
+        with c2:
+            if chatter_apoyos.empty:
+                st.info("No hay datos de Chatter Apoyos.")
+            else:
+                n = chatter_apoyos[chatter_apoyos["Resultado"] == "Nok"].groupby("Apoyo").size().reset_index(name="NOK").sort_values("NOK", ascending=False)
+                fig = px.bar(n, x="Apoyo", y="NOK", title="Chatter Apoyos — NOK por Apoyo")
+                st.plotly_chart(fig, use_container_width=True)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if not chatter_levas.empty:
+                n = chatter_levas[chatter_levas["Resultado"] == "Nok"].groupby(["Caracteristica", "Area"]).size().reset_index(name="NOK")
+                fig = px.bar(n, x="Caracteristica", y="NOK", color="Area", barmode="group", title="Chatter Levas — NOK por característica y área")
+                st.plotly_chart(fig, use_container_width=True)
+        with c2:
+            if not chatter_apoyos.empty:
+                n = chatter_apoyos[chatter_apoyos["Resultado"] == "Nok"].groupby("Caracteristica").size().reset_index(name="NOK").sort_values("NOK", ascending=False)
+                fig = px.bar(n, x="NOK", y="Caracteristica", orientation="h", title="Chatter Apoyos — NOK por característica")
+                fig.update_layout(yaxis={"categoryorder": "total ascending"})
+                st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("#### Distribución de medición de Chatter")
+        chatter_frames = []
+        if not chatter_levas.empty:
+            x = chatter_levas.copy(); x["Tipo"] = "Leva"; chatter_frames.append(x)
+        if not chatter_apoyos.empty:
+            x = chatter_apoyos.copy(); x["Tipo"] = "Apoyo"; chatter_frames.append(x)
+        if chatter_frames:
+            cf = pd.concat(chatter_frames, ignore_index=True)
+            chars_chatter = sorted(cf["Caracteristica"].dropna().astype(str).unique())
+            selected_chatter_char = st.selectbox("Característica de Chatter", chars_chatter, key="v91_chatter_char")
+            cd = cf[cf["Caracteristica"].astype(str) == selected_chatter_char].copy()
+            if not cd.empty:
+                fig = px.histogram(cd, x="Medicion", color="Tipo", marginal="box", nbins=40, title=f"Distribución — {selected_chatter_char}")
+                fig.add_vline(x=CHATTER_LEVAS_THRESHOLD, line_dash="dash", annotation_text="Umbral Levas 0.0001")
+                fig.add_vline(x=CHATTER_APOYOS_THRESHOLD, line_dash="dot", annotation_text="Umbral Apoyos 0.00008")
+                st.plotly_chart(fig, use_container_width=True)
+
+    with tab5:
         selected = st.selectbox("Selecciona una característica para profundizar", sorted(view["Caracteristica"].dropna().unique()))
         d = view[view["Caracteristica"] == selected].copy()
         if not d.empty:
@@ -950,9 +1019,10 @@ def dashboard(data: Dict[str, pd.DataFrame]):
 # ============================================================
 with st.sidebar:
     st.markdown("## ⚙️ Configuración")
-    batch_limit = st.number_input("Máximo PDFs únicos por lote", min_value=25, max_value=250, value=DEFAULT_BATCH_LIMIT, step=25)
+    st.metric("Máximo de PDFs por ejecución", f"{MAX_INPUT_PDFS:,}")
+    st.metric("Bloque interno de procesamiento", f"{PROCESS_CHUNK_SIZE}")
     workers = st.slider("Workers paralelos", min_value=1, max_value=MAX_WORKERS, value=4)
-    st.caption("Para Community Cloud se recomienda 4–6 workers y lotes de 100–150 PDFs.")
+    st.caption("Puedes seleccionar hasta 1,500 PDFs de una vez. El motor los procesa internamente en bloques de 150 para controlar la RAM.")
     st.divider()
     st.markdown("### Reglas activas")
     st.code("Levas (5) 301-400 UPR ≥ 0.0001 → NOK\nChatter Apoyos → 0.00008", language="text")
@@ -960,19 +1030,19 @@ with st.sidebar:
         reset_workspace()
 
 st.markdown("### 1️⃣ Cargar archivos")
-st.info("Modo seguro de memoria: procesa lotes de hasta 150 PDFs. Puedes repetir la carga hasta completar 1,500 o más PDFs. También acepta uno o varios ZIP y mezcla PDF + ZIP.")
+st.info("Modo optimizado: puedes seleccionar hasta 1,500 PDFs en una sola ejecución. La aplicación los procesa internamente en bloques de 150, libera memoria entre bloques y genera un único resultado acumulado. También acepta uno o varios ZIP y mezcla PDF + ZIP.")
 
 uploaded_files = st.file_uploader(
     "Selecciona PDFs y/o ZIPs",
     type=["pdf", "zip"],
     accept_multiple_files=True,
-    help="Para máxima estabilidad en Streamlit Community Cloud, selecciona 100–150 PDFs por lote. Los ZIP se extraen y procesan en disco temporal.",
+    help="Puedes seleccionar hasta 1,500 PDFs. Internamente se procesan en bloques de 150 para reducir el uso de RAM. Los ZIP se extraen y procesan en disco temporal.",
 )
 
 col_a, col_b = st.columns([1, 1])
 with col_a:
     if st.button("🚀 Procesar lote", type="primary", disabled=not uploaded_files, use_container_width=True):
-        st.session_state.last_summary = process_uploaded_batch(uploaded_files, int(batch_limit), int(workers))
+        st.session_state.last_summary = process_uploaded_batch(uploaded_files, int(workers))
 with col_b:
     conn = db_conn()
     processed_count = conn.execute("SELECT COUNT(*) FROM files WHERE status='OK'").fetchone()[0]
