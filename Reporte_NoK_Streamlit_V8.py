@@ -49,10 +49,9 @@ from openpyxl.utils import get_column_letter
 # ============================================================
 # CONFIGURACIÓN
 # ============================================================
-APP_VERSION = "V9.2"
+APP_VERSION = "V10.0"
 MAX_ZIP_DEPTH = 8
 MAX_INPUT_PDFS = 1500
-PROCESS_CHUNK_SIZE = 150
 MAX_WORKERS = 6
 
 CHATTER_LEVAS_THRESHOLD = 0.0001
@@ -579,17 +578,18 @@ def make_ford_df(chatter_apoyos: pd.DataFrame) -> pd.DataFrame:
     return df[COLUMNS]
 
 
-def save_batch_frames(batch_dir: Path, frames: Dict[str, pd.DataFrame]):
+def save_individual_result(pdf_dir: Path, frames: Dict[str, pd.DataFrame]):
+    pdf_dir.mkdir(parents=True, exist_ok=True)
     for sheet, df in frames.items():
         if df is None or df.empty:
             continue
         safe_sheet = re.sub(r"[^A-Za-z0-9_-]+", "_", sheet)
-        path = batch_dir / f"{safe_sheet}.csv.gz"
-        df.to_csv(path, index=False, compression="gzip")
+        df.to_csv(pdf_dir / f"{safe_sheet}.csv.gz", index=False, compression="gzip")
 
 
 def read_all_sheet(sheet: str) -> pd.DataFrame:
-    files = sorted((WORKSPACE / "batches").glob(f"*/{re.sub(r'[^A-Za-z0-9_-]+','_',sheet)}.csv.gz"))
+    pattern = f"{re.sub(r'[^A-Za-z0-9_-]+','_',sheet)}.csv.gz"
+    files = sorted((WORKSPACE / "batches").glob(f"**/{pattern}"))
     frames = []
     for p in files:
         try:
@@ -610,18 +610,17 @@ def build_master(data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     frames = [x for x in frames if not x.empty]
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=COLUMNS)
 
-
 def process_uploaded_batch(uploaded_files: List, workers: int) -> Dict[str, int]:
     conn = db_conn()
     source_dir = WORKSPACE / "incoming" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     source_dir.mkdir(parents=True, exist_ok=True)
 
     with st.status("Preparando archivos…", expanded=True) as status:
-        st.write(f"Recibidos: {len(uploaded_files)} archivo(s)")
+        st.write(f"Recibidos: {len(uploaded_files):,} archivo(s)")
         pdf_paths, input_errors = materialize_uploaded_sources(uploaded_files, source_dir)
-        st.write(f"PDFs encontrados en PDF/ZIP: {len(pdf_paths)}")
+        st.write(f"PDFs encontrados en PDF/ZIP: {len(pdf_paths):,}")
         if input_errors:
-            st.warning(f"{len(input_errors)} entrada(s) no se pudieron preparar.")
+            st.warning(f"{len(input_errors):,} entrada(s) no se pudieron preparar.")
 
     unique_jobs = []
     duplicates = 0
@@ -650,70 +649,79 @@ def process_uploaded_batch(uploaded_files: List, workers: int) -> Dict[str, int]
     batch_dir.mkdir(parents=True, exist_ok=True)
 
     errors = list(input_errors)
-    progress = st.progress(0, text="Procesando PDFs…")
+    progress = st.progress(0, text="Procesando PDFs individualmente…")
     started = time.perf_counter()
     completed = 0
     jobs = [(p, name, num, digest) for p, name, num, digest in unique_jobs]
 
-    # Importante: el usuario puede cargar hasta 1,500 PDFs de una vez, pero el
-    # motor sólo mantiene PROCESS_CHUNK_SIZE resultados PDF en memoria a la vez.
-    for chunk_start in range(0, len(jobs), PROCESS_CHUNK_SIZE):
-        chunk = jobs[chunk_start:chunk_start + PROCESS_CHUNK_SIZE]
-        frames_acc = {k: [] for k in ["Apoyos", "Levas", "chatter Levas", "Chatter apoyos"]}
-        chunk_errors = []
+    # Cada PDF conserva su resultado individual. No se concatena ni se descarta
+    # información por bloques de 150. Los resultados de cada PDF se escriben
+    # inmediatamente en su propia carpeta persistente del workspace.
+    with st.status("Procesamiento individual", expanded=False) as status:
+        with ThreadPoolExecutor(max_workers=min(max(1, workers), max(1, len(jobs) or 1))) as executor:
+            future_map = {
+                executor.submit(process_pdf_job, (p, name, num)): (p, name, num, digest)
+                for p, name, num, digest in jobs
+            }
+            for future in as_completed(future_map):
+                p, name, num, digest = future_map[future]
+                try:
+                    out = future.result()
+                    if out["ok"]:
+                        individual_dir = batch_dir / f"Pieza_{num:05d}_{digest[:8]}"
+                        frames = dict(out["data"])
+                        # Chatter Journal Ford se conserva como una hoja individual
+                        # derivada del mismo PDF, sin perder el origen.
+                        ford = make_ford_df(frames.get("Chatter apoyos", pd.DataFrame(columns=COLUMNS)))
+                        if not ford.empty:
+                            frames["Chatter Journal Ford"] = ford
+                        save_individual_result(individual_dir, frames)
+                        register_file(conn, digest, name, num, "OK", "")
+                    else:
+                        register_file(conn, digest, name, num, "ERROR", out["error"])
+                        errors.append(f"{name}: {out['error']}")
+                except Exception as e:
+                    err = f"{type(e).__name__}: {e}"
+                    register_file(conn, digest, name, num, "ERROR", err)
+                    errors.append(f"{name}: {err}")
 
-        with st.status(f"Procesando bloque {chunk_start // PROCESS_CHUNK_SIZE + 1}…", expanded=False) as block_status:
-            with ThreadPoolExecutor(max_workers=min(max(1, workers), max(1, len(chunk)))) as executor:
-                future_map = {executor.submit(process_pdf_job, (p, name, num)): (p, name, num, digest) for p, name, num, digest in chunk}
-                for future in as_completed(future_map):
-                    p, name, num, digest = future_map[future]
-                    try:
-                        out = future.result()
-                        if out["ok"]:
-                            for sheet, df in out["data"].items():
-                                if not df.empty:
-                                    frames_acc[sheet].append(df)
-                            register_file(conn, digest, name, num, "OK", "")
-                        else:
-                            register_file(conn, digest, name, num, "ERROR", out["error"])
-                            chunk_errors.append(f"{name}: {out['error']}")
-                    except Exception as e:
-                        register_file(conn, digest, name, num, "ERROR", f"{type(e).__name__}: {e}")
-                        chunk_errors.append(f"{name}: {type(e).__name__}: {e}")
+                completed += 1
+                elapsed = max(time.perf_counter() - started, 0.001)
+                rate = completed / elapsed
+                eta = (len(jobs) - completed) / rate if rate else 0
+                progress.progress(
+                    completed / max(len(jobs), 1),
+                    text=f"{completed:,}/{len(jobs):,} PDFs | {rate:.1f} PDF/s | ETA {eta/60:.1f} min"
+                )
 
-                    completed += 1
-                    elapsed = max(time.perf_counter() - started, 0.001)
-                    rate = completed / elapsed
-                    eta = (len(jobs) - completed) / rate if rate else 0
-                    progress.progress(completed / max(len(jobs), 1), text=f"{completed:,}/{len(jobs):,} | {rate:.1f} PDF/s | ETA {eta/60:.1f} min")
-
-            # Escribimos inmediatamente el bloque en CSV comprimido y liberamos
-            # sus DataFrames antes de comenzar el siguiente bloque.
-            chunk_frames = {}
-            for sheet, parts in frames_acc.items():
-                if parts:
-                    chunk_frames[sheet] = pd.concat(parts, ignore_index=True)
-            ford = make_ford_df(chunk_frames.get("Chatter apoyos", pd.DataFrame(columns=COLUMNS)))
-            if not ford.empty:
-                chunk_frames["Chatter Journal Ford"] = ford
-            save_batch_frames(batch_dir, chunk_frames)
-            del chunk_frames, frames_acc
-            errors.extend(chunk_errors)
-            block_status.update(label=f"Bloque terminado: {len(chunk):,} PDFs", state="complete")
+        status.update(label=f"Procesamiento terminado: {completed:,} PDF(s)", state="complete")
 
     (batch_dir / "errors.json").write_text(json.dumps(errors, ensure_ascii=False, indent=2), encoding="utf-8")
     (batch_dir / "meta.json").write_text(json.dumps({
-        "batch_id": batch_id, "files": len(uploaded_files), "pdfs": len(pdf_paths),
-        "processed": len(jobs), "duplicates": duplicates,
-        "errors": len(errors), "elapsed_s": time.perf_counter() - started,
-        "input_limit": MAX_INPUT_PDFS, "internal_chunk_size": PROCESS_CHUNK_SIZE,
+        "batch_id": batch_id,
+        "files": len(uploaded_files),
+        "pdfs": len(pdf_paths),
+        "processed": len(jobs),
+        "duplicates": duplicates,
+        "errors": len(errors),
+        "elapsed_s": time.perf_counter() - started,
+        "input_limit": MAX_INPUT_PDFS,
+        "processing_mode": "individual_pdf",
     }, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # Los PDFs temporales se eliminan; sólo quedan resultados compactos CSV.gz.
     shutil.rmtree(source_dir, ignore_errors=True)
 
-    st.success(f"Carga terminada: {len(jobs):,} PDF(s) procesados en bloques de {PROCESS_CHUNK_SIZE}, {duplicates:,} duplicado(s), {len(errors):,} incidencia(s).")
-    return {"recibidos": len(uploaded_files), "pdfs": len(pdf_paths), "procesados": len(jobs), "duplicados": duplicates, "errores": len(errors)}
+    st.success(
+        f"Carga terminada: {len(jobs):,} PDF(s) procesados individualmente, "
+        f"{duplicates:,} duplicado(s), {len(errors):,} incidencia(s)."
+    )
+    return {
+        "recibidos": len(uploaded_files),
+        "pdfs": len(pdf_paths),
+        "procesados": len(jobs),
+        "duplicados": duplicates,
+        "errores": len(errors),
+    }
 
 
 # ============================================================
@@ -1020,9 +1028,8 @@ def dashboard(data: Dict[str, pd.DataFrame]):
 with st.sidebar:
     st.markdown("## ⚙️ Configuración")
     st.metric("Máximo de PDFs por ejecución", f"{MAX_INPUT_PDFS:,}")
-    st.metric("Bloque interno de procesamiento", f"{PROCESS_CHUNK_SIZE}")
     workers = st.slider("Workers paralelos", min_value=1, max_value=MAX_WORKERS, value=4)
-    st.caption("Puedes seleccionar hasta 1,500 PDFs de una vez. El motor los procesa internamente en bloques de 150 para controlar la RAM.")
+    st.caption("Puedes seleccionar hasta 1,500 PDFs de una vez. Cada PDF se procesa y guarda individualmente para conservar todas sus mediciones.")
     st.divider()
     st.markdown("### Reglas activas")
     st.code("Levas (5) 301-400 UPR ≥ 0.0001 → NOK\nChatter Apoyos → 0.00008", language="text")
@@ -1030,13 +1037,13 @@ with st.sidebar:
         reset_workspace()
 
 st.markdown("### 1️⃣ Cargar archivos")
-st.info("Modo optimizado: puedes seleccionar hasta 1,500 PDFs en una sola ejecución. La aplicación los procesa internamente en bloques de 150, libera memoria entre bloques y genera un único resultado acumulado. También acepta uno o varios ZIP y mezcla PDF + ZIP.")
+st.info("Modo individual: puedes seleccionar hasta 1,500 PDFs en una sola ejecución. Cada PDF conserva sus registros, mediciones, Pieza, Leva/Apoyo y Resultado; después todos se consolidan en el reporte final. También acepta uno o varios ZIP y mezcla PDF + ZIP.")
 
 uploaded_files = st.file_uploader(
     "Selecciona PDFs y/o ZIPs",
     type=["pdf", "zip"],
     accept_multiple_files=True,
-    help="Puedes seleccionar hasta 1,500 PDFs. Internamente se procesan en bloques de 150 para reducir el uso de RAM. Los ZIP se extraen y procesan en disco temporal.",
+    help="Puedes seleccionar hasta 1,500 PDFs. Cada PDF se procesa individualmente y sus resultados se conservan antes de consolidar el reporte. Los ZIP se extraen y procesan en disco temporal.",
 )
 
 col_a, col_b = st.columns([1, 1])
@@ -1083,4 +1090,4 @@ if error_count:
         rows = conn.execute("SELECT filename,piece,error,processed_at FROM files WHERE status='ERROR' ORDER BY piece").fetchall()
         st.dataframe(pd.DataFrame(rows, columns=["Archivo","Pieza","Error","Fecha"]), use_container_width=True)
 
-st.caption(f"Reporte NoK {APP_VERSION} · procesamiento por lotes · SHA-256 · {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+st.caption(f"Reporte NoK {APP_VERSION} · procesamiento individual por PDF · SHA-256 · {datetime.now().strftime('%Y-%m-%d %H:%M')}")
