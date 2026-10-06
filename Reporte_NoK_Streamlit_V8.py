@@ -59,7 +59,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 # ============================================================
 # CONFIGURACIÓN
 # ============================================================
-APP_VERSION = "V9.4"
+APP_VERSION = "V9.5"
 MAX_ZIP_DEPTH = 8
 MAX_INPUT_PDFS = 1500
 PROCESS_CHUNK_SIZE = 150
@@ -951,6 +951,15 @@ def generate_dashboard_pdf(data: Dict[str, pd.DataFrame]) -> bytes:
     rt = Table([["Indicador", "Piezas NOK"]] + reg5_area_rows, colWidths=[260, 100])
     rt.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#111827")),("TEXTCOLOR",(0,0),(-1,0),colors.white),("GRID",(0,0),(-1,-1),0.4,colors.grey),("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("ALIGN",(1,1),(1,-1),"CENTER")]))
     story.append(rt)
+    # Top piezas NOK para trazabilidad ejecutiva. El detalle completo queda en Excel.
+    piece_counts = nok.groupby("Pieza").size().sort_values(ascending=False).head(12) if not nok.empty else pd.Series(dtype=int)
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("Top piezas con mayor número de mediciones NOK", h))
+    if not piece_counts.empty:
+        pt = [["Pieza", "Mediciones NOK"]] + [[str(k), int(v)] for k, v in piece_counts.items()]
+        ptable = Table(pt, colWidths=[180, 110])
+        ptable.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#111827")),("TEXTCOLOR",(0,0),(-1,0),colors.white),("GRID",(0,0),(-1,-1),0.35,colors.grey),("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("ALIGN",(1,1),(1,-1),"CENTER")]))
+        story.append(ptable)
     if not reg5_area.empty:
         figb = _pdf_bar(reg5_area.values, reg5_area.index, "REG 5 NOK por área", horizontal=False)
         story.append(Spacer(1, 8)); story.append(RLImage(figb, width=430, height=190))
@@ -988,6 +997,8 @@ def generate_dashboard_pdf(data: Dict[str, pd.DataFrame]) -> bytes:
 # DASHBOARD
 # ============================================================
 def dashboard(data: Dict[str, pd.DataFrame]):
+    """Dashboard ejecutivo. Los bloques internos de 150 son solo de procesamiento;
+    aquí se consolida y muestra el resultado individual de todas las piezas."""
     for _k in ["Apoyos", "Levas", "chatter Levas", "Chatter apoyos", "Chatter Journal Ford"]:
         data.setdefault(_k, pd.DataFrame(columns=COLUMNS))
     master = build_master(data)
@@ -995,70 +1006,103 @@ def dashboard(data: Dict[str, pd.DataFrame]):
         st.info("Procesa al menos un lote para activar el dashboard.")
         return
 
+    master = master.copy()
     master["Medicion"] = pd.to_numeric(master["Medicion"], errors="coerce")
-    nok = master[master["Resultado"] == "Nok"].copy()
-    total = master["Pieza"].nunique()
-    nok_pieces = nok["Pieza"].nunique()
-    ftq = (total - nok_pieces) / total * 100 if total else 0
+    nok = master[master["Resultado"].eq("Nok")].copy()
+    total = int(master["Pieza"].nunique())
+    nok_pieces = int(nok["Pieza"].nunique())
+    ok_pieces = max(total - nok_pieces, 0)
+    ftq = ok_pieces / total * 100 if total else 0
     rejection = nok_pieces / total * 100 if total else 0
 
-    # Filtros
+    # ---------------- FILTROS ----------------
     with st.sidebar:
         st.markdown("### 🎛️ Filtros del análisis")
         areas = sorted(master["Area"].dropna().astype(str).unique().tolist())
-        selected_areas = st.multiselect("Área", areas, default=areas)
+        selected_areas = st.multiselect("Área", areas, default=areas, key="dash_areas")
+        results = st.multiselect("Resultado", ["Ok", "Nok"], default=["Ok", "Nok"], key="dash_results")
         chars = sorted(master["Caracteristica"].dropna().astype(str).unique().tolist())
-        selected_chars = st.multiselect("Característica", chars, default=chars[:20] if len(chars) > 20 else chars)
-        results = st.multiselect("Resultado", ["Ok", "Nok"], default=["Ok", "Nok"])
+        selected_chars = st.multiselect("Característica", chars, default=chars, key="dash_chars")
 
     view = master[master["Area"].isin(selected_areas) & master["Resultado"].isin(results)].copy()
     if selected_chars:
         view = view[view["Caracteristica"].isin(selected_chars)]
-    view_nok = view[view["Resultado"] == "Nok"]
+    view_nok = view[view["Resultado"].eq("Nok")]
 
+    # ---------------- ENCABEZADO EJECUTIVO ----------------
+    st.markdown("## 📊 Executive Quality Dashboard")
+    st.caption(f"Reporte consolidado · {total:,} piezas · Los bloques de 150 son internos y no fragmentan el resultado final")
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Piezas", f"{total:,}")
-    c2.metric("Piezas NOK", f"{nok_pieces:,}")
-    c3.metric("FTQ", f"{ftq:.2f}%")
-    c4.metric("Rechazo", f"{rejection:.2f}%")
-    c5.metric("NOK mediciones", f"{len(nok):,}")
+    c1.metric("Piezas analizadas", f"{total:,}")
+    c2.metric("Piezas OK", f"{ok_pieces:,}")
+    c3.metric("Piezas NOK", f"{nok_pieces:,}")
+    c4.metric("FTQ", f"{ftq:.2f}%")
+    c5.metric("Rechazo", f"{rejection:.2f}%")
 
-    # Desglose visible de REG 5, como en las versiones anteriores.
+    # ---------------- REG 5 ----------------
     reg5 = "(5) 301-400 UPR"
-    reg5_piece_ids = set(nok.loc[nok["Caracteristica"].eq(reg5), "Pieza"].dropna().tolist()) if not nok.empty else set()
-    reg5_only = 0
-    reg5_others = 0
+    reg5_nok = nok[nok["Caracteristica"].eq(reg5)].copy()
+    reg5_piece_ids = set(reg5_nok["Pieza"].dropna().tolist())
+    reg5_only_ids, reg5_other_ids = set(), set()
     for pid in reg5_piece_ids:
-        chars = set(nok.loc[nok["Pieza"].eq(pid), "Caracteristica"].dropna().tolist())
-        if chars == {reg5}:
-            reg5_only += 1
+        chars_piece = set(nok.loc[nok["Pieza"].eq(pid), "Caracteristica"].dropna().astype(str))
+        if chars_piece == {reg5}:
+            reg5_only_ids.add(pid)
         else:
-            reg5_others += 1
-    r1, r2, r3 = st.columns(3)
-    r1.metric("REG 5 NOK", f"{len(reg5_piece_ids):,}")
-    r2.metric("REG 5 solamente", f"{reg5_only:,}")
-    r3.metric("REG 5 + otra(s)", f"{reg5_others:,}")
+            reg5_other_ids.add(pid)
+    reg5_area = (reg5_nok[reg5_nok["Area"].isin(["Base Circle", "Lift Area"])]
+                 .groupby("Area")["Pieza"].nunique()
+                 .reindex(["Base Circle", "Lift Area"], fill_value=0))
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["🏁 Ejecutivo", "🟦 Levas", "🟩 Apoyos", "🔥 Chatter", "🔎 Características"])
+    st.markdown("### 🎯 REG 5 — (5) 301-400 UPR")
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("REG 5 NOK", f"{len(reg5_piece_ids):,}")
+    r2.metric("Base Circle NOK", f"{int(reg5_area.get('Base Circle', 0)):,}")
+    r3.metric("Lift Area NOK", f"{int(reg5_area.get('Lift Area', 0)):,}")
+    r4.metric("REG 5 + otras", f"{len(reg5_other_ids):,}")
+    st.caption(f"Solo REG 5: {len(reg5_only_ids):,} piezas · Umbral Levas: ≥ 0.0001")
+
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "🏁 Ejecutivo", "🎯 REG 5", "🟦 Levas", "🟩 Apoyos", "🔥 Chatter", "📋 Piezas"
+    ])
 
     with tab1:
         col1, col2 = st.columns(2)
         with col1:
-            counts = pd.DataFrame({"Resultado": ["OK", "NOK"], "Cantidad": [len(view[view.Resultado=="Ok"]), len(view[view.Resultado=="Nok"])]})
-            fig = px.pie(counts, names="Resultado", values="Cantidad", hole=0.58, title="Distribución OK / NOK")
-            fig.update_layout(height=390, legend_title_text="")
+            counts = pd.DataFrame({"Resultado": ["OK", "NOK"], "Cantidad": [ok_pieces, nok_pieces]})
+            fig = px.pie(counts, names="Resultado", values="Cantidad", hole=0.60, title="Distribución de piezas")
+            fig.update_layout(height=390, margin=dict(l=20,r=20,t=55,b=20), legend_title_text="")
             st.plotly_chart(fig, use_container_width=True)
         with col2:
             by_char = view_nok.groupby("Caracteristica").size().reset_index(name="NOK").sort_values("NOK", ascending=False).head(15)
-            fig = px.bar(by_char, x="NOK", y="Caracteristica", orientation="h", title="Top características NOK")
+            fig = px.bar(by_char, x="NOK", y="Caracteristica", orientation="h", title="Top 15 características NOK")
             fig.update_layout(height=390, yaxis={"categoryorder":"total ascending"})
             st.plotly_chart(fig, use_container_width=True)
-
-        by_area = view_nok.groupby("Area").size().reset_index(name="NOK")
-        fig = px.bar(by_area, x="Area", y="NOK", title="NOK por área")
-        st.plotly_chart(fig, use_container_width=True)
+        by_area = view_nok.groupby("Area").size().reset_index(name="NOK").sort_values("NOK", ascending=False)
+        if not by_area.empty:
+            fig = px.bar(by_area, x="Area", y="NOK", title="NOK por área")
+            st.plotly_chart(fig, use_container_width=True)
 
     with tab2:
+        st.markdown("#### Separación obligatoria de REG 5 por área")
+        reg5_tbl = pd.DataFrame({
+            "Área": ["Base Circle", "Lift Area"],
+            "Piezas NOK": [int(reg5_area.get("Base Circle",0)), int(reg5_area.get("Lift Area",0))],
+            "Mediciones NOK": [int(((reg5_nok["Area"]=="Base Circle")).sum()), int(((reg5_nok["Area"]=="Lift Area")).sum())],
+        })
+        st.dataframe(reg5_tbl, hide_index=True, use_container_width=True)
+        if reg5_area.sum() > 0:
+            fig = px.bar(reg5_tbl, x="Área", y="Piezas NOK", title="REG 5 — piezas NOK: Base Circle vs Lift Area", text="Piezas NOK")
+            st.plotly_chart(fig, use_container_width=True)
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Piezas NOK SOLO por REG 5", f"{len(reg5_only_ids):,}")
+        with col2:
+            st.metric("Piezas NOK REG 5 + otras características", f"{len(reg5_other_ids):,}")
+        if not reg5_nok.empty:
+            st.dataframe(reg5_nok.sort_values(["Area","Pieza"]), hide_index=True, use_container_width=True, height=350)
+
+    with tab3:
         levas = view[view["Area"].isin(["Levas", "Base Circle", "Lift Area"])].copy()
         if levas.empty:
             st.info("No hay datos de Levas en los filtros actuales.")
@@ -1066,135 +1110,105 @@ def dashboard(data: Dict[str, pd.DataFrame]):
             col1, col2 = st.columns(2)
             with col1:
                 n = levas[levas.Resultado=="Nok"].groupby("Leva").size().reset_index(name="NOK").sort_values("NOK", ascending=False)
-                fig = px.bar(n, x="Leva", y="NOK", title="NOK por Leva")
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(px.bar(n, x="Leva", y="NOK", title="NOK por Leva"), use_container_width=True)
             with col2:
                 n = levas[levas.Resultado=="Nok"].groupby("Caracteristica").size().reset_index(name="NOK").sort_values("NOK", ascending=False)
                 fig = px.bar(n, x="NOK", y="Caracteristica", orientation="h", title="NOK por característica de Levas")
                 fig.update_layout(yaxis={"categoryorder":"total ascending"})
                 st.plotly_chart(fig, use_container_width=True)
+            heat = levas[levas.Resultado=="Nok"].pivot_table(index="Caracteristica", columns="Leva", values="Pieza", aggfunc="nunique", fill_value=0)
+            if not heat.empty:
+                st.plotly_chart(px.imshow(heat, aspect="auto", title="Mapa de calor — piezas NOK por característica × Leva"), use_container_width=True)
 
-            if "Leva" in levas.columns:
-                heat = levas[levas.Resultado=="Nok"].pivot_table(index="Caracteristica", columns="Leva", values="Pieza", aggfunc="nunique", fill_value=0)
-                if not heat.empty:
-                    fig = px.imshow(heat, aspect="auto", title="Mapa de calor: piezas NOK por característica × Leva", labels=dict(x="Leva", y="Característica", color="Piezas NOK"))
-                    st.plotly_chart(fig, use_container_width=True)
-
-            chatter = data.get("chatter Levas", pd.DataFrame(columns=COLUMNS))
-            if not chatter.empty:
-                chatter_nok = chatter[chatter.Resultado=="Nok"]
-                n = chatter_nok.groupby(["Area","Caracteristica"]).size().reset_index(name="NOK")
-                fig = px.bar(n, x="Caracteristica", y="NOK", color="Area", barmode="group", title="Chatter Levas: NOK por característica y área")
-                st.plotly_chart(fig, use_container_width=True)
-
-    with tab3:
-        apoyos = view[view["Area"] == "Apoyos"].copy()
+    with tab4:
+        apoyos = view[view["Area"].eq("Apoyos")].copy()
         if apoyos.empty:
             st.info("No hay datos de Apoyos en los filtros actuales.")
         else:
             col1, col2 = st.columns(2)
             with col1:
                 n = apoyos[apoyos.Resultado=="Nok"].groupby("Apoyo").size().reset_index(name="NOK").sort_values("NOK", ascending=False)
-                fig = px.bar(n, x="Apoyo", y="NOK", title="NOK por Apoyo")
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(px.bar(n, x="Apoyo", y="NOK", title="NOK por Apoyo"), use_container_width=True)
             with col2:
                 n = apoyos[apoyos.Resultado=="Nok"].groupby("Caracteristica").size().reset_index(name="NOK").sort_values("NOK", ascending=False)
                 fig = px.bar(n, x="NOK", y="Caracteristica", orientation="h", title="NOK por característica de Apoyos")
                 fig.update_layout(yaxis={"categoryorder":"total ascending"})
                 st.plotly_chart(fig, use_container_width=True)
-
             heat = apoyos[apoyos.Resultado=="Nok"].pivot_table(index="Caracteristica", columns="Apoyo", values="Pieza", aggfunc="nunique", fill_value=0)
             if not heat.empty:
-                fig = px.imshow(heat, aspect="auto", title="Mapa de calor: piezas NOK por característica × Apoyo", labels=dict(x="Apoyo", y="Característica", color="Piezas NOK"))
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(px.imshow(heat, aspect="auto", title="Mapa de calor — piezas NOK por característica × Apoyo"), use_container_width=True)
 
-            chatter = data.get("Chatter apoyos", pd.DataFrame(columns=COLUMNS))
-            if not chatter.empty:
-                chatter_nok = chatter[chatter.Resultado=="Nok"]
-                n = chatter_nok.groupby("Caracteristica").size().reset_index(name="NOK").sort_values("NOK", ascending=False)
-                fig = px.bar(n, x="NOK", y="Caracteristica", orientation="h", title="Chatter Apoyos: NOK por característica")
-                fig.update_layout(yaxis={"categoryorder":"total ascending"})
-                st.plotly_chart(fig, use_container_width=True)
-
-    with tab4:
-        st.markdown("### 🔥 Análisis específico de Chatter")
+    with tab5:
+        st.markdown("### 🔥 Chatter — análisis separado")
         chatter_levas = data.get("chatter Levas", pd.DataFrame(columns=COLUMNS)).copy()
         chatter_apoyos = data.get("Chatter apoyos", pd.DataFrame(columns=COLUMNS)).copy()
-        chatter_levas["Medicion"] = pd.to_numeric(chatter_levas.get("Medicion", pd.Series(dtype=float)), errors="coerce") if not chatter_levas.empty else chatter_levas.get("Medicion", pd.Series(dtype=float))
-        chatter_apoyos["Medicion"] = pd.to_numeric(chatter_apoyos.get("Medicion", pd.Series(dtype=float)), errors="coerce") if not chatter_apoyos.empty else chatter_apoyos.get("Medicion", pd.Series(dtype=float))
-
         c1, c2 = st.columns(2)
         with c1:
-            if chatter_levas.empty:
-                st.info("No hay datos de Chatter Levas.")
+            if chatter_levas.empty: st.info("No hay datos de Chatter Levas.")
             else:
-                n = chatter_levas[chatter_levas["Resultado"] == "Nok"].groupby("Leva").size().reset_index(name="NOK").sort_values("NOK", ascending=False)
-                fig = px.bar(n, x="Leva", y="NOK", title="Chatter Levas — NOK por Leva")
-                st.plotly_chart(fig, use_container_width=True)
+                n = chatter_levas[chatter_levas.Resultado=="Nok"].groupby("Leva").size().reset_index(name="NOK")
+                st.plotly_chart(px.bar(n, x="Leva", y="NOK", title="Chatter Levas — NOK por Leva"), use_container_width=True)
         with c2:
-            if chatter_apoyos.empty:
-                st.info("No hay datos de Chatter Apoyos.")
+            if chatter_apoyos.empty: st.info("No hay datos de Chatter Apoyos.")
             else:
-                n = chatter_apoyos[chatter_apoyos["Resultado"] == "Nok"].groupby("Apoyo").size().reset_index(name="NOK").sort_values("NOK", ascending=False)
-                fig = px.bar(n, x="Apoyo", y="NOK", title="Chatter Apoyos — NOK por Apoyo")
-                st.plotly_chart(fig, use_container_width=True)
-
+                n = chatter_apoyos[chatter_apoyos.Resultado=="Nok"].groupby("Apoyo").size().reset_index(name="NOK")
+                st.plotly_chart(px.bar(n, x="Apoyo", y="NOK", title="Chatter Apoyos — NOK por Apoyo"), use_container_width=True)
         c1, c2 = st.columns(2)
         with c1:
             if not chatter_levas.empty:
-                n = chatter_levas[chatter_levas["Resultado"] == "Nok"].groupby(["Caracteristica", "Area"]).size().reset_index(name="NOK")
-                fig = px.bar(n, x="Caracteristica", y="NOK", color="Area", barmode="group", title="Chatter Levas — NOK por característica y área")
-                st.plotly_chart(fig, use_container_width=True)
+                n = chatter_levas[chatter_levas.Resultado=="Nok"].groupby(["Caracteristica","Area"]).size().reset_index(name="NOK")
+                st.plotly_chart(px.bar(n, x="Caracteristica", y="NOK", color="Area", barmode="group", title="Chatter Levas — Base Circle vs Lift Area"), use_container_width=True)
         with c2:
             if not chatter_apoyos.empty:
-                n = chatter_apoyos[chatter_apoyos["Resultado"] == "Nok"].groupby("Caracteristica").size().reset_index(name="NOK").sort_values("NOK", ascending=False)
+                n = chatter_apoyos[chatter_apoyos.Resultado=="Nok"].groupby("Caracteristica").size().reset_index(name="NOK")
                 fig = px.bar(n, x="NOK", y="Caracteristica", orientation="h", title="Chatter Apoyos — NOK por característica")
-                fig.update_layout(yaxis={"categoryorder": "total ascending"})
+                fig.update_layout(yaxis={"categoryorder":"total ascending"})
                 st.plotly_chart(fig, use_container_width=True)
-
-        st.markdown("#### Distribución de medición de Chatter")
-        chatter_frames = []
+        frames=[]
         if not chatter_levas.empty:
-            x = chatter_levas.copy(); x["Tipo"] = "Leva"; chatter_frames.append(x)
+            x=chatter_levas.copy(); x["Tipo"]="Leva"; frames.append(x)
         if not chatter_apoyos.empty:
-            x = chatter_apoyos.copy(); x["Tipo"] = "Apoyo"; chatter_frames.append(x)
-        if chatter_frames:
-            cf = pd.concat(chatter_frames, ignore_index=True)
-            chars_chatter = sorted(cf["Caracteristica"].dropna().astype(str).unique())
-            selected_chatter_char = st.selectbox("Característica de Chatter", chars_chatter, key="v91_chatter_char")
-            cd = cf[cf["Caracteristica"].astype(str) == selected_chatter_char].copy()
+            x=chatter_apoyos.copy(); x["Tipo"]="Apoyo"; frames.append(x)
+        if frames:
+            cf=pd.concat(frames, ignore_index=True)
+            chars_chatter=sorted(cf["Caracteristica"].dropna().astype(str).unique())
+            selected=st.selectbox("Característica de Chatter", chars_chatter, key="v95_chatter_char")
+            cd=cf[cf["Caracteristica"].astype(str).eq(selected)]
             if not cd.empty:
-                fig = px.histogram(cd, x="Medicion", color="Tipo", marginal="box", nbins=40, title=f"Distribución — {selected_chatter_char}")
-                fig.add_vline(x=CHATTER_LEVAS_THRESHOLD, line_dash="dash", annotation_text="Umbral Levas 0.0001")
-                fig.add_vline(x=CHATTER_APOYOS_THRESHOLD, line_dash="dot", annotation_text="Umbral Apoyos 0.00008")
-                st.plotly_chart(fig, use_container_width=True)
+                fig=px.histogram(cd,x="Medicion",color="Tipo",marginal="box",nbins=40,title=f"Distribución de medición — {selected}")
+                fig.add_vline(x=CHATTER_LEVAS_THRESHOLD,line_dash="dash",annotation_text="Levas 0.0001")
+                fig.add_vline(x=CHATTER_APOYOS_THRESHOLD,line_dash="dot",annotation_text="Apoyos 0.00008")
+                st.plotly_chart(fig,use_container_width=True)
 
-    with tab5:
-        selected = st.selectbox("Selecciona una característica para profundizar", sorted(view["Caracteristica"].dropna().unique()))
-        d = view[view["Caracteristica"] == selected].copy()
-        if not d.empty:
-            col1, col2 = st.columns(2)
-            with col1:
-                d2 = d.groupby("Resultado").size().reset_index(name="Cantidad")
-                fig = px.pie(d2, names="Resultado", values="Cantidad", hole=.55, title=f"{selected}: OK / NOK")
-                st.plotly_chart(fig, use_container_width=True)
-            with col2:
-                fig = px.box(d, x="Resultado", y="Medicion", points="outliers", title=f"Distribución de medición — {selected}")
-                if d["Spec Min"].notna().any():
-                    fig.add_hline(y=float(d["Spec Min"].dropna().iloc[0]), line_dash="dash", annotation_text="Spec Min")
-                if d["Spec Max"].notna().any():
-                    fig.add_hline(y=float(d["Spec Max"].dropna().iloc[0]), line_dash="dash", annotation_text="Spec Max")
-                st.plotly_chart(fig, use_container_width=True)
+    with tab6:
+        st.markdown("### 📋 Resultado individual por pieza")
+        st.caption("Esta tabla está consolidada de todos los bloques internos. No representa lotes de 150.")
+        piece_rows=[]
+        for pid, g in master.groupby("Pieza", sort=True):
+            bad=g[g["Resultado"].eq("Nok")]
+            bad_chars=sorted(set(bad["Caracteristica"].dropna().astype(str)))
+            piece_rows.append({
+                "Pieza": pid,
+                "Resultado": "NOK" if not bad.empty else "OK",
+                "NOK mediciones": len(bad),
+                "Características NOK": ", ".join(bad_chars) if bad_chars else "—",
+                "REG 5": "NOK" if reg5 in bad_chars else "OK",
+                "REG 5 área": ", ".join(sorted(set(bad.loc[bad["Caracteristica"].eq(reg5),"Area"].dropna().astype(str)))) if reg5 in bad_chars else "—",
+                "Archivo PDF": str(g["Nombre del archivo"].iloc[0]),
+            })
+        pieces_df=pd.DataFrame(piece_rows)
+        piece_filter=st.multiselect("Mostrar", ["OK","NOK"], default=["OK","NOK"], key="piece_result_filter")
+        search=st.text_input("🔎 Buscar pieza o archivo PDF", key="piece_search").strip().lower()
+        pieces_view=pieces_df[pieces_df["Resultado"].isin(piece_filter)].copy()
+        if search:
+            mask=pieces_view.apply(lambda r: search in str(r["Pieza"]).lower() or search in str(r["Archivo PDF"]).lower(), axis=1)
+            pieces_view=pieces_view[mask]
+        st.metric("Piezas mostradas", f"{len(pieces_view):,}")
+        st.dataframe(pieces_view, hide_index=True, use_container_width=True, height=520)
 
-            location_col = "Leva" if d["Leva"].notna().any() else "Apoyo"
-            loc = d[d.Resultado=="Nok"].groupby(location_col).size().reset_index(name="NOK").sort_values("NOK", ascending=False)
-            if not loc.empty:
-                fig = px.bar(loc, x=location_col, y="NOK", title=f"{selected}: NOK por {location_col}")
-                st.plotly_chart(fig, use_container_width=True)
-
-    st.markdown("### 🔍 Registros NOK")
+    st.markdown("### 🔍 Registros NOK individuales")
     if not nok.empty:
-        st.dataframe(nok.sort_values(["Caracteristica", "Pieza"]), use_container_width=True, height=350)
+        st.dataframe(nok.sort_values(["Pieza", "Caracteristica"]), hide_index=True, use_container_width=True, height=360)
 
 
 # ============================================================
@@ -1256,7 +1270,7 @@ with col2:
         st.download_button(
             "⬇️ Descargar Reporte_NoK.xlsx",
             data=st.session_state.excel_bytes,
-            file_name="Reporte_NoK.xlsx",
+            file_name=f"Reporte_NoK_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
@@ -1269,7 +1283,7 @@ with col3:
         st.download_button(
             "⬇️ Descargar Dashboard PDF",
             data=st.session_state.dashboard_pdf,
-            file_name="Reporte_NoK_Dashboard.pdf",
+            file_name=f"Reporte_NoK_Dashboard_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
             mime="application/pdf",
             use_container_width=True,
         )
