@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Reporte NoK Streamlit V9.1 - optimizado para Streamlit Community Cloud
+Reporte NoK Streamlit V9.3 - optimizado para Streamlit Community Cloud
 
 Objetivos:
 - PDFs individuales y uno/muchos ZIP.
@@ -45,14 +45,25 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
+# PDF ejecutivo del dashboard
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage, PageBreak
+
 
 # ============================================================
 # CONFIGURACIÓN
 # ============================================================
-APP_VERSION = "V10.0"
+APP_VERSION = "V9.3"
 MAX_ZIP_DEPTH = 8
 MAX_INPUT_PDFS = 1500
-MAX_WORKERS = 6
+PROCESS_CHUNK_SIZE = 150
+MAX_WORKERS = 8
 
 CHATTER_LEVAS_THRESHOLD = 0.0001
 CHATTER_APOYOS_THRESHOLD = 0.00008
@@ -257,10 +268,13 @@ def known_hash(conn, sha256: str) -> bool:
     return conn.execute("SELECT 1 FROM files WHERE sha256=?", (sha256,)).fetchone() is not None
 
 
-def register_file(conn, sha256, filename, piece, status="OK", error=""):
-    conn.execute(
+def register_files_bulk(conn, rows):
+    """Registra un bloque completo con un solo commit (más rápido que commit por PDF)."""
+    if not rows:
+        return
+    conn.executemany(
         "INSERT OR REPLACE INTO files(sha256,filename,piece,status,error,processed_at) VALUES(?,?,?,?,?,?)",
-        (sha256, filename, piece, status, error, datetime.now().isoformat(timespec="seconds")),
+        rows,
     )
     conn.commit()
 
@@ -479,7 +493,7 @@ def parse_pdf(pdf_path: Path, filename: str, piece: int) -> Dict[str, object]:
                 for i in range(min(num, len(CHATTER_APOYOS_CHARACTERISTICS))):
                     char = CHATTER_APOYOS_CHARACTERISTICS[i]
                     measurement = raw[i * 2]
-                    result["Chatter apoyos"].append(base_row(
+                    result["chatter apoyos"].append(base_row(
                         filename, piece, apoyo=apoyo, char=char,
                         medicion=measurement, area="Apoyos",
                         resultado=get_resultado(measurement, char, "Chatter_Apoyos"),
@@ -578,18 +592,17 @@ def make_ford_df(chatter_apoyos: pd.DataFrame) -> pd.DataFrame:
     return df[COLUMNS]
 
 
-def save_individual_result(pdf_dir: Path, frames: Dict[str, pd.DataFrame]):
-    pdf_dir.mkdir(parents=True, exist_ok=True)
+def save_batch_frames(batch_dir: Path, frames: Dict[str, pd.DataFrame]):
     for sheet, df in frames.items():
         if df is None or df.empty:
             continue
         safe_sheet = re.sub(r"[^A-Za-z0-9_-]+", "_", sheet)
-        df.to_csv(pdf_dir / f"{safe_sheet}.csv.gz", index=False, compression="gzip")
+        path = batch_dir / f"{safe_sheet}.csv.gz"
+        df.to_csv(path, index=False, compression={"method": "gzip", "compresslevel": 1})
 
 
 def read_all_sheet(sheet: str) -> pd.DataFrame:
-    pattern = f"{re.sub(r'[^A-Za-z0-9_-]+','_',sheet)}.csv.gz"
-    files = sorted((WORKSPACE / "batches").glob(f"**/{pattern}"))
+    files = sorted((WORKSPACE / "batches").glob(f"*/{re.sub(r'[^A-Za-z0-9_-]+','_',sheet)}.csv.gz"))
     frames = []
     for p in files:
         try:
@@ -610,17 +623,18 @@ def build_master(data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     frames = [x for x in frames if not x.empty]
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=COLUMNS)
 
+
 def process_uploaded_batch(uploaded_files: List, workers: int) -> Dict[str, int]:
     conn = db_conn()
     source_dir = WORKSPACE / "incoming" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     source_dir.mkdir(parents=True, exist_ok=True)
 
     with st.status("Preparando archivos…", expanded=True) as status:
-        st.write(f"Recibidos: {len(uploaded_files):,} archivo(s)")
+        st.write(f"Recibidos: {len(uploaded_files)} archivo(s)")
         pdf_paths, input_errors = materialize_uploaded_sources(uploaded_files, source_dir)
-        st.write(f"PDFs encontrados en PDF/ZIP: {len(pdf_paths):,}")
+        st.write(f"PDFs encontrados en PDF/ZIP: {len(pdf_paths)}")
         if input_errors:
-            st.warning(f"{len(input_errors):,} entrada(s) no se pudieron preparar.")
+            st.warning(f"{len(input_errors)} entrada(s) no se pudieron preparar.")
 
     unique_jobs = []
     duplicates = 0
@@ -649,79 +663,75 @@ def process_uploaded_batch(uploaded_files: List, workers: int) -> Dict[str, int]
     batch_dir.mkdir(parents=True, exist_ok=True)
 
     errors = list(input_errors)
-    progress = st.progress(0, text="Procesando PDFs individualmente…")
+    progress = st.progress(0, text="Procesando PDFs…")
     started = time.perf_counter()
     completed = 0
     jobs = [(p, name, num, digest) for p, name, num, digest in unique_jobs]
 
-    # Cada PDF conserva su resultado individual. No se concatena ni se descarta
-    # información por bloques de 150. Los resultados de cada PDF se escriben
-    # inmediatamente en su propia carpeta persistente del workspace.
-    with st.status("Procesamiento individual", expanded=False) as status:
-        with ThreadPoolExecutor(max_workers=min(max(1, workers), max(1, len(jobs) or 1))) as executor:
-            future_map = {
-                executor.submit(process_pdf_job, (p, name, num)): (p, name, num, digest)
-                for p, name, num, digest in jobs
-            }
-            for future in as_completed(future_map):
-                p, name, num, digest = future_map[future]
-                try:
-                    out = future.result()
-                    if out["ok"]:
-                        individual_dir = batch_dir / f"Pieza_{num:05d}_{digest[:8]}"
-                        frames = dict(out["data"])
-                        # Chatter Journal Ford se conserva como una hoja individual
-                        # derivada del mismo PDF, sin perder el origen.
-                        ford = make_ford_df(frames.get("Chatter apoyos", pd.DataFrame(columns=COLUMNS)))
-                        if not ford.empty:
-                            frames["Chatter Journal Ford"] = ford
-                        save_individual_result(individual_dir, frames)
-                        register_file(conn, digest, name, num, "OK", "")
-                    else:
-                        register_file(conn, digest, name, num, "ERROR", out["error"])
-                        errors.append(f"{name}: {out['error']}")
-                except Exception as e:
-                    err = f"{type(e).__name__}: {e}"
-                    register_file(conn, digest, name, num, "ERROR", err)
-                    errors.append(f"{name}: {err}")
+    # Importante: el usuario puede cargar hasta 1,500 PDFs de una vez, pero el
+    # motor sólo mantiene PROCESS_CHUNK_SIZE resultados PDF en memoria a la vez.
+    for chunk_start in range(0, len(jobs), PROCESS_CHUNK_SIZE):
+        chunk = jobs[chunk_start:chunk_start + PROCESS_CHUNK_SIZE]
+        frames_acc = {k: [] for k in ["Apoyos", "Levas", "chatter Levas", "Chatter apoyos"]}
+        chunk_errors = []
+        registrations = []
 
-                completed += 1
-                elapsed = max(time.perf_counter() - started, 0.001)
-                rate = completed / elapsed
-                eta = (len(jobs) - completed) / rate if rate else 0
-                progress.progress(
-                    completed / max(len(jobs), 1),
-                    text=f"{completed:,}/{len(jobs):,} PDFs | {rate:.1f} PDF/s | ETA {eta/60:.1f} min"
-                )
+        with st.status(f"Procesando bloque {chunk_start // PROCESS_CHUNK_SIZE + 1}…", expanded=False) as block_status:
+            with ThreadPoolExecutor(max_workers=min(max(1, workers), max(1, len(chunk)))) as executor:
+                future_map = {executor.submit(process_pdf_job, (p, name, num)): (p, name, num, digest) for p, name, num, digest in chunk}
+                for future in as_completed(future_map):
+                    p, name, num, digest = future_map[future]
+                    try:
+                        out = future.result()
+                        if out["ok"]:
+                            for sheet, df in out["data"].items():
+                                if not df.empty:
+                                    frames_acc[sheet].append(df)
+                            registrations.append((digest, name, num, "OK", "", datetime.now().isoformat(timespec="seconds")))
+                        else:
+                            registrations.append((digest, name, num, "ERROR", out["error"], datetime.now().isoformat(timespec="seconds")))
+                            chunk_errors.append(f"{name}: {out['error']}")
+                    except Exception as e:
+                        err = f"{type(e).__name__}: {e}"
+                        registrations.append((digest, name, num, "ERROR", err, datetime.now().isoformat(timespec="seconds")))
+                        chunk_errors.append(f"{name}: {err}")
 
-        status.update(label=f"Procesamiento terminado: {completed:,} PDF(s)", state="complete")
+                    completed += 1
+                    elapsed = max(time.perf_counter() - started, 0.001)
+                    rate = completed / elapsed
+                    eta = (len(jobs) - completed) / rate if rate else 0
+                    progress.progress(completed / max(len(jobs), 1), text=f"{completed:,}/{len(jobs):,} | {rate:.1f} PDF/s | ETA {eta/60:.1f} min")
+
+            # Un solo commit por bloque evita miles de operaciones de disco SQLite.
+            register_files_bulk(conn, registrations)
+
+            # Escribimos inmediatamente el bloque en CSV comprimido y liberamos
+            # sus DataFrames antes de comenzar el siguiente bloque.
+            chunk_frames = {}
+            for sheet, parts in frames_acc.items():
+                if parts:
+                    chunk_frames[sheet] = pd.concat(parts, ignore_index=True)
+            ford = make_ford_df(chunk_frames.get("chatter apoyos", pd.DataFrame(columns=COLUMNS)))
+            if not ford.empty:
+                chunk_frames["Chatter Journal Ford"] = ford
+            save_batch_frames(batch_dir, chunk_frames)
+            del chunk_frames, frames_acc
+            errors.extend(chunk_errors)
+            block_status.update(label=f"Bloque terminado: {len(chunk):,} PDFs", state="complete")
 
     (batch_dir / "errors.json").write_text(json.dumps(errors, ensure_ascii=False, indent=2), encoding="utf-8")
     (batch_dir / "meta.json").write_text(json.dumps({
-        "batch_id": batch_id,
-        "files": len(uploaded_files),
-        "pdfs": len(pdf_paths),
-        "processed": len(jobs),
-        "duplicates": duplicates,
-        "errors": len(errors),
-        "elapsed_s": time.perf_counter() - started,
-        "input_limit": MAX_INPUT_PDFS,
-        "processing_mode": "individual_pdf",
+        "batch_id": batch_id, "files": len(uploaded_files), "pdfs": len(pdf_paths),
+        "processed": len(jobs), "duplicates": duplicates,
+        "errors": len(errors), "elapsed_s": time.perf_counter() - started,
+        "input_limit": MAX_INPUT_PDFS, "internal_chunk_size": PROCESS_CHUNK_SIZE,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    # Los PDFs temporales se eliminan; sólo quedan resultados compactos CSV.gz.
     shutil.rmtree(source_dir, ignore_errors=True)
 
-    st.success(
-        f"Carga terminada: {len(jobs):,} PDF(s) procesados individualmente, "
-        f"{duplicates:,} duplicado(s), {len(errors):,} incidencia(s)."
-    )
-    return {
-        "recibidos": len(uploaded_files),
-        "pdfs": len(pdf_paths),
-        "procesados": len(jobs),
-        "duplicados": duplicates,
-        "errores": len(errors),
-    }
+    st.success(f"Carga terminada: {len(jobs):,} PDF(s) procesados en bloques de {PROCESS_CHUNK_SIZE}, {duplicates:,} duplicado(s), {len(errors):,} incidencia(s).")
+    return {"recibidos": len(uploaded_files), "pdfs": len(pdf_paths), "procesados": len(jobs), "duplicados": duplicates, "errores": len(errors)}
 
 
 # ============================================================
@@ -761,6 +771,20 @@ def generate_excel() -> bytes:
     total_chars = len(master)
     nok_chars = len(nok)
 
+    # Desglose solicitado: piezas rechazadas por REG 5, separando las que
+    # fallaron únicamente por esta característica de las que además fallaron
+    # por otra(s) característica(s).
+    reg5 = "(5) 301-400 UPR"
+    reg5_nok_pieces = set(nok.loc[nok["Caracteristica"].eq(reg5), "Pieza"].dropna().tolist()) if not nok.empty else set()
+    reg5_only = 0
+    reg5_and_others = 0
+    for piece_id in reg5_nok_pieces:
+        chars = set(nok.loc[nok["Pieza"].eq(piece_id), "Caracteristica"].dropna().tolist())
+        if chars == {reg5}:
+            reg5_only += 1
+        else:
+            reg5_and_others += 1
+
     counts = nok["Caracteristica"].value_counts().reset_index() if not nok.empty else pd.DataFrame(columns=["Caracteristica", "Cantidad_NOK"])
     counts.columns = ["Caracteristica", "Cantidad_NOK"]
     detail = []
@@ -784,7 +808,11 @@ def generate_excel() -> bytes:
         "Metrica": [
             "Total de piezas analizadas", "Piezas OK", "Piezas NOK", "% Rechazo",
             "FTQ", "Total de características", "Características OK", "Características NOK",
-            "% Características NOK", "Umbral Levas (5) 301-400 UPR", "Umbral Chatter Apoyos",
+            "% Características NOK",
+            'Piezas NOK por REG 5 (301-400 UPR)',
+            'Piezas NOK SOLO por REG 5 (301-400 UPR)',
+            'Piezas NOK por REG 5 + otras características',
+            "Umbral Levas (5) 301-400 UPR", "Umbral Chatter Apoyos",
         ],
         "Valor": [
             total_pieces, ok_pieces, nok_pieces,
@@ -792,6 +820,7 @@ def generate_excel() -> bytes:
             (ok_pieces / total_pieces * 100) if total_pieces else 0,
             total_chars, total_chars - nok_chars, nok_chars,
             (nok_chars / total_chars * 100) if total_chars else 0,
+            len(reg5_nok_pieces), reg5_only, reg5_and_others,
             CHATTER_LEVAS_THRESHOLD, CHATTER_APOYOS_THRESHOLD,
         ],
     })
@@ -823,6 +852,136 @@ def generate_excel() -> bytes:
     wb.save(bio)
     bio.seek(0)
     return bio.getvalue()
+
+
+# ============================================================
+# PDF EJECUTIVO DEL DASHBOARD
+# ============================================================
+def _pdf_fig_bytes(fig):
+    bio = io.BytesIO()
+    fig.savefig(bio, format="png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    bio.seek(0)
+    return bio
+
+
+def _pdf_bar(values, labels, title, xlabel="Cantidad", horizontal=False):
+    fig, ax = plt.subplots(figsize=(10, 4.6))
+    vals = list(values); labs = [str(x) for x in labels]
+    if horizontal:
+        ax.barh(labs[::-1], vals[::-1])
+        ax.set_xlabel(xlabel)
+    else:
+        ax.bar(labs, vals)
+        ax.set_ylabel(xlabel)
+        ax.tick_params(axis="x", rotation=35)
+    ax.set_title(title, fontweight="bold")
+    ax.grid(axis="y", alpha=0.2)
+    return _pdf_fig_bytes(fig)
+
+
+def generate_dashboard_pdf(data: Dict[str, pd.DataFrame]) -> bytes:
+    data = dict(data)
+    for k in ["Apoyos", "Levas", "chatter Levas", "Chatter apoyos", "Chatter Journal Ford"]:
+        data.setdefault(k, pd.DataFrame(columns=COLUMNS))
+    master = build_master(data)
+    if master.empty:
+        raise ValueError("No hay datos procesados para generar el PDF.")
+    master = master.copy()
+    master["Medicion"] = pd.to_numeric(master["Medicion"], errors="coerce")
+    nok = master[master["Resultado"] == "Nok"].copy()
+    total = int(master["Pieza"].nunique())
+    nok_pieces = int(nok["Pieza"].nunique())
+    ok_pieces = max(total - nok_pieces, 0)
+    ftq = ok_pieces / total * 100 if total else 0
+    rejection = nok_pieces / total * 100 if total else 0
+
+    reg5 = "(5) 301-400 UPR"
+    reg5_nok = nok[nok["Caracteristica"].eq(reg5)].copy()
+    reg5_piece_ids = set(reg5_nok["Pieza"].dropna().tolist())
+    reg5_only = 0; reg5_others = 0
+    for pid in reg5_piece_ids:
+        chars = set(nok.loc[nok["Pieza"].eq(pid), "Caracteristica"].dropna().tolist())
+        if chars == {reg5}: reg5_only += 1
+        else: reg5_others += 1
+
+    # Separación explícita de REG 5 por Base Circle y Lift Area.
+    reg5_area = (reg5_nok[reg5_nok["Area"].isin(["Base Circle", "Lift Area"])]
+                 .groupby("Area")["Pieza"].nunique()
+                 .reindex(["Base Circle", "Lift Area"], fill_value=0))
+    reg5_area_rows = [
+        ["REG 5 — Base Circle", int(reg5_area.get("Base Circle", 0))],
+        ["REG 5 — Lift Area", int(reg5_area.get("Lift Area", 0))],
+        ["REG 5 — Total de piezas NOK", len(reg5_piece_ids)],
+        ["REG 5 — Solo REG 5", reg5_only],
+        ["REG 5 — REG 5 + otras", reg5_others],
+    ]
+
+    top = nok.groupby("Caracteristica").size().sort_values(ascending=False).head(12)
+    chatter_levas = data["chatter Levas"].copy()
+    chatter_apoyos = data["Chatter apoyos"].copy()
+    cln = chatter_levas[chatter_levas["Resultado"] == "Nok"] if not chatter_levas.empty else chatter_levas
+    can = chatter_apoyos[chatter_apoyos["Resultado"] == "Nok"] if not chatter_apoyos.empty else chatter_apoyos
+    chatter_levas_by = cln.groupby("Leva").size().sort_values(ascending=False) if not cln.empty else pd.Series(dtype=int)
+    chatter_apoyos_by = can.groupby("Apoyo").size().sort_values(ascending=False) if not can.empty else pd.Series(dtype=int)
+
+    pdf = io.BytesIO()
+    doc = SimpleDocTemplate(pdf, pagesize=landscape(A4), rightMargin=28, leftMargin=28, topMargin=28, bottomMargin=28)
+    styles = getSampleStyleSheet()
+    title = ParagraphStyle("Title2", parent=styles["Title"], alignment=TA_CENTER, fontSize=20, leading=24, spaceAfter=10)
+    h = ParagraphStyle("H2x", parent=styles["Heading2"], fontSize=14, leading=17, spaceBefore=6, spaceAfter=8)
+    small = ParagraphStyle("smallx", parent=styles["BodyText"], fontSize=8, leading=10)
+    story = []
+    story.append(Paragraph("Reporte NoK — Dashboard Ejecutivo de Calidad", title))
+    story.append(Paragraph(f"Generado: {datetime.now().strftime('%Y-%m-%d %H:%M')} | Versión {APP_VERSION}", small))
+    story.append(Spacer(1, 10))
+
+    metrics = [
+        ["Piezas analizadas", f"{total:,}", "Piezas OK", f"{ok_pieces:,}", "Piezas NOK", f"{nok_pieces:,}"],
+        ["FTQ", f"{ftq:.2f}%", "Rechazo", f"{rejection:.2f}%", "Mediciones NOK", f"{len(nok):,}"],
+    ]
+    mt = Table(metrics, colWidths=[110, 70, 90, 70, 95, 70])
+    mt.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),colors.HexColor("#F3F4F6")),("GRID",(0,0),(-1,-1),0.4,colors.grey),("FONTNAME",(0,0),(-1,-1),"Helvetica"),("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("ALIGN",(1,0),(1,-1),"CENTER"),("ALIGN",(3,0),(3,-1),"CENTER"),("ALIGN",(5,0),(5,-1),"CENTER")]))
+    story.append(mt); story.append(Spacer(1, 10))
+
+    okfig = _pdf_bar([ok_pieces, nok_pieces], ["OK", "NOK"], "Piezas OK vs NOK", horizontal=False)
+    story.append(RLImage(okfig, width=360, height=165))
+    story.append(Spacer(1, 6))
+    story.append(Paragraph("REG 5 — (5) 301-400 UPR", h))
+    rt = Table([["Indicador", "Piezas NOK"]] + reg5_area_rows, colWidths=[260, 100])
+    rt.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#111827")),("TEXTCOLOR",(0,0),(-1,0),colors.white),("GRID",(0,0),(-1,-1),0.4,colors.grey),("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("ALIGN",(1,1),(1,-1),"CENTER")]))
+    story.append(rt)
+    if not reg5_area.empty:
+        figb = _pdf_bar(reg5_area.values, reg5_area.index, "REG 5 NOK por área", horizontal=False)
+        story.append(Spacer(1, 8)); story.append(RLImage(figb, width=430, height=190))
+    story.append(PageBreak())
+
+    story.append(Paragraph("Características NOK", h))
+    if not top.empty:
+        f = _pdf_bar(top.values, top.index, "Top características NOK", horizontal=True)
+        story.append(RLImage(f, width=650, height=285))
+    else:
+        story.append(Paragraph("No se encontraron características NOK.", small))
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("Regla activa: REG 5 en Levas = umbral 0.0001; el reporte conserva Base Circle y Lift Area por separado.", small))
+    story.append(PageBreak())
+
+    story.append(Paragraph("Chatter Levas", h))
+    if not chatter_levas_by.empty:
+        f = _pdf_bar(chatter_levas_by.values, chatter_levas_by.index, "Chatter Levas — NOK por Leva", horizontal=False)
+        story.append(RLImage(f, width=650, height=285))
+    else: story.append(Paragraph("No hay Chatter Levas NOK.", small))
+    story.append(Spacer(1, 10))
+    story.append(Paragraph("Chatter Apoyos", h))
+    if not chatter_apoyos_by.empty:
+        f = _pdf_bar(chatter_apoyos_by.values, chatter_apoyos_by.index, "Chatter Apoyos — NOK por Apoyo", horizontal=False)
+        story.append(RLImage(f, width=650, height=285))
+    else: story.append(Paragraph("No hay Chatter Apoyos NOK.", small))
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("Este PDF es un resumen ejecutivo; el Excel conserva el detalle completo por pieza, característica, leva y apoyo.", small))
+    doc.build(story)
+    pdf.seek(0)
+    return pdf.getvalue()
 
 
 # ============================================================
@@ -863,6 +1022,22 @@ def dashboard(data: Dict[str, pd.DataFrame]):
     c3.metric("FTQ", f"{ftq:.2f}%")
     c4.metric("Rechazo", f"{rejection:.2f}%")
     c5.metric("NOK mediciones", f"{len(nok):,}")
+
+    # Desglose visible de REG 5, como en las versiones anteriores.
+    reg5 = "(5) 301-400 UPR"
+    reg5_piece_ids = set(nok.loc[nok["Caracteristica"].eq(reg5), "Pieza"].dropna().tolist()) if not nok.empty else set()
+    reg5_only = 0
+    reg5_others = 0
+    for pid in reg5_piece_ids:
+        chars = set(nok.loc[nok["Pieza"].eq(pid), "Caracteristica"].dropna().tolist())
+        if chars == {reg5}:
+            reg5_only += 1
+        else:
+            reg5_others += 1
+    r1, r2, r3 = st.columns(3)
+    r1.metric("REG 5 NOK", f"{len(reg5_piece_ids):,}")
+    r2.metric("REG 5 solamente", f"{reg5_only:,}")
+    r3.metric("REG 5 + otra(s)", f"{reg5_others:,}")
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["🏁 Ejecutivo", "🟦 Levas", "🟩 Apoyos", "🔥 Chatter", "🔎 Características"])
 
@@ -1028,8 +1203,9 @@ def dashboard(data: Dict[str, pd.DataFrame]):
 with st.sidebar:
     st.markdown("## ⚙️ Configuración")
     st.metric("Máximo de PDFs por ejecución", f"{MAX_INPUT_PDFS:,}")
-    workers = st.slider("Workers paralelos", min_value=1, max_value=MAX_WORKERS, value=4)
-    st.caption("Puedes seleccionar hasta 1,500 PDFs de una vez. Cada PDF se procesa y guarda individualmente para conservar todas sus mediciones.")
+    st.metric("Bloque interno de procesamiento", f"{PROCESS_CHUNK_SIZE}")
+    workers = st.slider("Workers paralelos", min_value=1, max_value=MAX_WORKERS, value=8)
+    st.caption("Puedes seleccionar hasta 1,500 PDFs de una vez. El motor los procesa en bloques de 150, usa 8 workers por defecto y reduce las escrituras a disco para acelerar el proceso.")
     st.divider()
     st.markdown("### Reglas activas")
     st.code("Levas (5) 301-400 UPR ≥ 0.0001 → NOK\nChatter Apoyos → 0.00008", language="text")
@@ -1037,13 +1213,13 @@ with st.sidebar:
         reset_workspace()
 
 st.markdown("### 1️⃣ Cargar archivos")
-st.info("Modo individual: puedes seleccionar hasta 1,500 PDFs en una sola ejecución. Cada PDF conserva sus registros, mediciones, Pieza, Leva/Apoyo y Resultado; después todos se consolidan en el reporte final. También acepta uno o varios ZIP y mezcla PDF + ZIP.")
+st.info("Modo optimizado: puedes seleccionar hasta 1,500 PDFs en una sola ejecución. La aplicación los procesa internamente en bloques de 150, libera memoria entre bloques y genera un único resultado acumulado. También acepta uno o varios ZIP y mezcla PDF + ZIP.")
 
 uploaded_files = st.file_uploader(
     "Selecciona PDFs y/o ZIPs",
     type=["pdf", "zip"],
     accept_multiple_files=True,
-    help="Puedes seleccionar hasta 1,500 PDFs. Cada PDF se procesa individualmente y sus resultados se conservan antes de consolidar el reporte. Los ZIP se extraen y procesan en disco temporal.",
+    help="Puedes seleccionar hasta 1,500 PDFs. Internamente se procesan en bloques de 150 para reducir el uso de RAM. Los ZIP se extraen y procesan en disco temporal.",
 )
 
 col_a, col_b = st.columns([1, 1])
@@ -1068,7 +1244,7 @@ data_for_dashboard = all_processed_data()
 dashboard(data_for_dashboard)
 
 st.markdown("### 3️⃣ Exportación")
-col1, col2 = st.columns(2)
+col1, col2, col3 = st.columns(3)
 with col1:
     if st.button("📗 Generar Excel final", use_container_width=True, disabled=processed_count == 0):
         with st.spinner("Generando Excel de baja memoria…"):
@@ -1084,10 +1260,23 @@ with col2:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
+with col3:
+    if st.button("📄 Generar PDF del Dashboard", use_container_width=True, disabled=processed_count == 0):
+        with st.spinner("Generando PDF ejecutivo…"):
+            st.session_state.dashboard_pdf = generate_dashboard_pdf(data_for_dashboard)
+        st.success("PDF ejecutivo generado.")
+    if "dashboard_pdf" in st.session_state:
+        st.download_button(
+            "⬇️ Descargar Dashboard PDF",
+            data=st.session_state.dashboard_pdf,
+            file_name="Reporte_NoK_Dashboard.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
 
 if error_count:
     with st.expander(f"⚠️ Ver errores ({error_count})"):
         rows = conn.execute("SELECT filename,piece,error,processed_at FROM files WHERE status='ERROR' ORDER BY piece").fetchall()
         st.dataframe(pd.DataFrame(rows, columns=["Archivo","Pieza","Error","Fecha"]), use_container_width=True)
 
-st.caption(f"Reporte NoK {APP_VERSION} · procesamiento individual por PDF · SHA-256 · {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+st.caption(f"Reporte NoK {APP_VERSION} · procesamiento por lotes · SHA-256 · {datetime.now().strftime('%Y-%m-%d %H:%M')}")
